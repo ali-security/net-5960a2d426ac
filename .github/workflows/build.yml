@@ -1,0 +1,101 @@
+# Seal build/test CI for golang.org/x/net.
+#
+# Upstream golang.org/x/net has no GitHub Actions CI at all (it is developed on
+# Gerrit and tested by the Go project's own LUCI builders), so this workflow is
+# authored by Seal. Every command below is read off the repository itself: the
+# toolchain comes from the `go` directive in go.mod, and the build/test commands
+# are the standard `go build ./...` / `go test ./...` that CONTRIBUTING.md points
+# at via the Go contribution guidelines.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run instead of the full suite. Empty runs everything."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # go-version-file reads the `go 1.24.0` directive in go.mod, so the leg
+      # runs on exactly the toolchain the release declared. GOTOOLCHAIN=local
+      # keeps Go from silently switching to a newer downloaded toolchain.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Report toolchain
+        env:
+          GOTOOLCHAIN: local
+        run: go version
+
+      - name: Build
+        env:
+          GOTOOLCHAIN: local
+        run: go build ./...
+
+      # The published artifact is the module source zip that proxy.golang.org
+      # serves. golang.org/x/mod/zip.CreateFromDir is Go's own module-zip
+      # implementation, so it applies the proxy's exact inclusion rules.
+      #
+      # The tree is staged into RUNNER_TEMP first with .github excluded:
+      # upstream ships no .github directory, so the published zip has no
+      # .github members and this workflow would otherwise be an extra file in
+      # the artifact. Staging outside the workspace also keeps the zip output
+      # itself from being packaged.
+      - name: Build module zip
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -eo pipefail
+          mkdir -p "${RUNNER_TEMP}/modsrc" "${RUNNER_TEMP}/ziptool" "${RUNNER_TEMP}/dist"
+          rsync -a --exclude='.git' --exclude='.github' ./ "${RUNNER_TEMP}/modsrc/"
+          cp .github/seal/create_mod.go "${RUNNER_TEMP}/ziptool/create_mod.go"
+          cd "${RUNNER_TEMP}/ziptool"
+          # The helper lives in its own throwaway module so resolving x/mod
+          # never touches the library's go.mod/go.sum. v0.28.0 is the x/mod
+          # release current at v0.45.0's release date and declares go 1.24.0,
+          # matching the toolchain above.
+          go mod init example.com/ziptool
+          go get golang.org/x/mod@v0.28.0
+          go run ./create_mod.go golang.org/x/net v0.45.0 \
+            "${RUNNER_TEMP}/modsrc" "${RUNNER_TEMP}/dist/v0.45.0.zip"
+          unzip -l "${RUNNER_TEMP}/dist/v0.45.0.zip" | tail -1
+
+      # Full suite by default. A non-empty test-filter runs only the named
+      # tests, anchored so "TestFoo" cannot match "TestFooBar", and then fails
+      # closed unless every requested name logged its own `=== RUN` line.
+      - name: Test
+        env:
+          GOTOOLCHAIN: local
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -eo pipefail
+          if [ -n "${TEST_FILTER}" ]; then
+            go test -v -run "^($(echo "${TEST_FILTER}" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in ${TEST_FILTER}; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log \
+                || { echo "selected test ${t} never ran"; exit 1; }
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/dist/v0.45.0.zip
+          if-no-files-found: error
